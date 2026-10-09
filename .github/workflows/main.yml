@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-      - master
 
 jobs:
   build:
@@ -21,68 +20,131 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Android tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v4
 
-      - name: Extract ZIP files
+      - name: Extract ZIP and find project
         shell: bash
         run: |
           set -euo pipefail
 
+          sudo apt-get update
+          sudo apt-get install -y unzip
+
           mkdir -p extracted
 
-          while IFS= read -r -d '' file; do
-            echo "Extracting: $file"
-            unzip -o "$file" -d extracted
+          while IFS= read -r -d '' zipfile; do
+            echo "Extracting: $zipfile"
+            unzip -o "$zipfile" -d extracted
           done < <(
             find . -maxdepth 3 -type f -name '*.zip' \
               ! -path './extracted/*' -print0
           )
 
-          echo "Project files:"
-          find . -maxdepth 5 -type f | sort | head -300
+          echo "Searching for Gradle project..."
 
-      - name: Locate Gradle project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SETTINGS="$(find . \
-            -type d \( -name .git -o -name .gradle \) -prune -o \
-            -type f \( \
-              -name settings.gradle \
-              -o -name settings.gradle.kts \
-            \) -print -quit)"
+          SETTINGS=$(find extracted -maxdepth 10 -type f \( \
+            -name settings.gradle \
+            -o -name settings.gradle.kts \
+          \) -print -quit)
 
           if [ -z "$SETTINGS" ]; then
-            echo "::error::No settings.gradle or settings.gradle.kts found. The ZIP may not contain a complete Android Gradle project."
-            echo "Available project files:"
-            find extracted -maxdepth 7 -type f | sort | head -300
+            echo "::error::No Gradle settings file found in extracted ZIP."
+            find extracted -maxdepth 6 -type f | head -200
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$SETTINGS")"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          echo "Gradle project found at: $PROJECT_DIR"
-          ls -la "$PROJECT_DIR"
+          echo "Found project: $PROJECT_DIR"
+
+      - name: Fix Java and Kotlin JVM targets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_FILE="$PROJECT_DIR/app/build.gradle.kts"
+
+          if [ ! -f "$BUILD_FILE" ]; then
+            echo "::error::Missing $BUILD_FILE"
+            exit 1
+          fi
+
+          echo "Updating Java and Kotlin targets..."
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          p = Path(os.environ["PROJECT_DIR"]) / "app" / "build.gradle.kts"
+          s = p.read_text()
+
+          java_block = """
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          """
+
+          if "compileOptions {" in s:
+              s = re.sub(
+                  r"compileOptions\s*\{[^}]*\}",
+                  java_block.strip(),
+                  s,
+                  count=1
+              )
+          else:
+              pos = s.find("android {")
+              if pos < 0:
+                  raise SystemExit("ERROR: android { block not found")
+              start = pos + len("android {")
+              s = s[:start] + "\n" + java_block + s[start:]
+
+          kotlin_block = """
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          """
+
+          if "kotlinOptions {" in s:
+              s = re.sub(
+                  r"kotlinOptions\s*\{[^}]*\}",
+                  kotlin_block.strip(),
+                  s,
+                  count=1
+              )
+          else:
+              pos = s.find("android {")
+              start = pos + len("android {")
+              depth = 1
+              i = start
+              while i < len(s) and depth:
+                  if s[i] == "{":
+                      depth += 1
+                  elif s[i] == "}":
+                      depth -= 1
+                  i += 1
+              s = s[:i-1] + "\n" + kotlin_block + "\n" + s[i-1:]
+
+          p.write_text(s)
+          print("Updated:", p)
+          print(s)
+          PY
 
       - name: Build Debug APK
         shell: bash
         run: |
           set -euo pipefail
+
           cd "$PROJECT_DIR"
 
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
             ./gradlew --no-daemon assembleDebug
-          elif [ -f ./build.gradle ] || [ -f ./build.gradle.kts ]; then
-            gradle --no-daemon assembleDebug
           else
-            echo "::error::No Gradle build file found in the project root."
-            exit 1
+            gradle --no-daemon assembleDebug
           fi
 
       - name: Upload APK
@@ -90,6 +152,6 @@ jobs:
         with:
           name: Hubget-APK
           path: |
-            **/build/outputs/apk/debug/*.apk
+            extracted/**/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 7
