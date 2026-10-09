@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - master
 
 jobs:
   build:
@@ -20,50 +21,75 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Install Android tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip
 
-      - name: Extract ZIP and find project
+      - name: Extract ZIP files
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           mkdir -p extracted
 
-          find . -maxdepth 3 -type f -name '*.zip' \
-            ! -path './extracted/*' -print0 |
-          while IFS= read -r -d '' zipfile; do
-            echo "Extracting: $zipfile"
-            unzip -o "$zipfile" -d extracted
-          done
+          while IFS= read -r -d '' file; do
+            echo "Extracting: $file"
+            unzip -o "$file" -d extracted
+          done < <(
+            find . -maxdepth 3 -type f -name '*.zip' \
+              ! -path './extracted/*' -print0
+          )
 
-          echo "Searching for Gradle project..."
+          echo "Project files:"
+          find . -maxdepth 5 -type f | sort | head -300
 
-          SETTINGS=$(find extracted -maxdepth 10 -type f \( \
-            -name settings.gradle \
-            -o -name settings.gradle.kts \
-          \) -print -quit)
+      - name: Locate Gradle project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SETTINGS="$(find . \
+            -type d \( -name .git -o -name .gradle \) -prune -o \
+            -type f \( \
+              -name settings.gradle \
+              -o -name settings.gradle.kts \
+            \) -print -quit)"
 
           if [ -z "$SETTINGS" ]; then
-            echo "No Gradle settings file found."
-            echo "Project files:"
-            find extracted -maxdepth 5 -type f | head -200
+            echo "::error::No settings.gradle or settings.gradle.kts found. The ZIP may not contain a complete Android Gradle project."
+            echo "Available project files:"
+            find extracted -maxdepth 7 -type f | sort | head -300
             exit 1
           fi
 
-          PROJECT_DIR=$(dirname "$SETTINGS")
-          echo "Project found: $PROJECT_DIR"
+          PROJECT_DIR="$(dirname "$SETTINGS")"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-      - name: Build APK
+          echo "Gradle project found at: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      - name: Build Debug APK
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           cd "$PROJECT_DIR"
-          gradle assembleDebug
+
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon assembleDebug
+          elif [ -f ./build.gradle ] || [ -f ./build.gradle.kts ]; then
+            gradle --no-daemon assembleDebug
+          else
+            echo "::error::No Gradle build file found in the project root."
+            exit 1
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Hubget-APK
-          path: '**/build/outputs/apk/debug/*.apk'
+          path: |
+            **/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+          retention-days: 7
